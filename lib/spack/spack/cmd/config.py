@@ -47,6 +47,14 @@ def setup_parser(subparser):
                             metavar='SECTION',
                             choices=spack.config.section_schemas)
 
+    blame_parser = sp.add_parser(
+        'blame', help='print configuration annotated with source file:line')
+    blame_parser.add_argument('section',
+                              help="configuration section to print. "
+                              "options: %(choices)s",
+                              metavar='SECTION',
+                              choices=spack.config.section_schemas)
+
     edit_parser = sp.add_parser('edit', help='edit configuration file')
     edit_parser.add_argument('section',
                              help="configuration section to edit. "
@@ -57,6 +65,10 @@ def setup_parser(subparser):
 
 def config_get(args):
     spack.config.config.print_section(args.section)
+
+
+def config_blame(args):
+    spack.config.config.print_section(args.section, blame=True)
 
 
 def config_edit(args):
@@ -75,5 +87,6 @@ def config_edit(args):
 
 def config(parser, args):
     action = {'get': config_get,
+              'blame': config_blame,
               'edit': config_edit}
     action[args.config_command](args)
