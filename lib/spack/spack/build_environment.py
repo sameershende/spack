@@ -32,6 +32,7 @@ There are two parts to the build environment:
 Skimming this module is a nice way to get acquainted with the types of
 calls you can make from within the install() function.
 """
+import re
 import inspect
 import multiprocessing
 import os
@@ -45,6 +46,7 @@ import llnl.util.tty as tty
 from llnl.util.tty.color import cescape, colorize
 from llnl.util.filesystem import mkdirp, install, install_tree
 from llnl.util.lang import dedupe
+from llnl.util.tty.log import MultiProcessFd
 
 import spack.build_systems.cmake
 import spack.build_systems.meson
@@ -53,6 +55,8 @@ import spack.main
 import spack.paths
 import spack.schema.environment
 import spack.store
+import spack.subprocess_context
+import spack.architecture as arch
 from spack.util.string import plural
 from spack.util.environment import (
     env_flag, filter_system_paths, get_path, is_system_path,
@@ -60,7 +64,7 @@ from spack.util.environment import (
 from spack.util.environment import system_dirs
 from spack.error import NoLibrariesError, NoHeadersError
 from spack.util.executable import Executable
-from spack.util.module_cmd import load_module, get_path_from_module
+from spack.util.module_cmd import load_module, path_from_modules, module
 from spack.util.log_parse import parse_log_events, make_log_context
 
 
@@ -145,6 +149,40 @@ def clean_environment():
     env.unset('CPATH')
     env.unset('LD_RUN_PATH')
     env.unset('DYLD_LIBRARY_PATH')
+    env.unset('DYLD_FALLBACK_LIBRARY_PATH')
+
+    # On Cray "cluster" systems, unset CRAY_LD_LIBRARY_PATH to avoid
+    # interference with Spack dependencies.
+    # CNL requires these variables to be set (or at least some of them,
+    # depending on the CNL version).
+    hostarch = arch.Arch(arch.platform(), 'default_os', 'default_target')
+    on_cray = str(hostarch.platform) == 'cray'
+    using_cnl = re.match(r'cnl\d+', str(hostarch.os))
+    if on_cray and not using_cnl:
+        env.unset('CRAY_LD_LIBRARY_PATH')
+        for varname in os.environ.keys():
+            if 'PKGCONF' in varname:
+                env.unset(varname)
+
+    # Unset the following variables because they can affect installation of
+    # Autotools and CMake packages.
+    build_system_vars = [
+        'CC', 'CFLAGS', 'CPP', 'CPPFLAGS',  # C variables
+        'CXX', 'CCC', 'CXXFLAGS', 'CXXCPP',  # C++ variables
+        'F77', 'FFLAGS', 'FLIBS',  # Fortran77 variables
+        'FC', 'FCFLAGS', 'FCLIBS',  # Fortran variables
+        'LDFLAGS', 'LIBS'  # linker variables
+    ]
+    for v in build_system_vars:
+        env.unset(v)
+
+    # Unset mpi environment vars. These flags should only be set by
+    # mpi providers for packages with mpi dependencies
+    mpi_vars = [
+        'MPICC', 'MPICXX', 'MPIFC', 'MPIF77', 'MPIF90'
+    ]
+    for v in mpi_vars:
+        env.unset(v)
 
     build_lang = spack.config.get('config:build_language')
     if build_lang:
@@ -169,6 +207,9 @@ def set_compiler_environment_variables(pkg, env):
     assert pkg.spec.concrete
     compiler = pkg.compiler
     spec = pkg.spec
+
+    # Make sure the executables for this compiler exist
+    compiler.verify_executables()
 
     # Set compiler variables used by CMake and autotools
     assert all(key in compiler.link_paths for key in (
@@ -348,10 +389,6 @@ def set_build_environment_variables(pkg, env, dirty):
         extra_rpaths = ':'.join(compiler.extra_rpaths)
         env.set('SPACK_COMPILER_EXTRA_RPATHS', extra_rpaths)
 
-    implicit_rpaths = compiler.implicit_rpaths()
-    if implicit_rpaths:
-        env.set('SPACK_COMPILER_IMPLICIT_RPATHS', ':'.join(implicit_rpaths))
-
     # Add bin directories from dependencies to the PATH for the build.
     for prefix in build_prefixes:
         for dirname in ['bin', 'bin64']:
@@ -414,7 +451,7 @@ def _set_variables_for_single_module(pkg, module):
     if getattr(module, marker, False):
         return
 
-    jobs = spack.config.get('config:build_jobs') if pkg.parallel else 1
+    jobs = spack.config.get('config:build_jobs', 16) if pkg.parallel else 1
     jobs = min(jobs, multiprocessing.cpu_count())
     assert jobs is not None, "no default set for config:build_jobs"
 
@@ -531,7 +568,7 @@ def _static_to_shared_library(arch, compiler, static_lib, shared_lib=None,
 
     # TODO: Compiler arguments should not be hardcoded but provided by
     #       the different compiler classes.
-    if 'linux' in arch:
+    if 'linux' in arch or 'cray' in arch:
         soname = os.path.basename(shared_lib)
 
         if compat_version:
@@ -607,8 +644,8 @@ def get_rpaths(pkg):
     # Second module is our compiler mod name. We use that to get rpaths from
     # module show output.
     if pkg.compiler.modules and len(pkg.compiler.modules) > 1:
-        rpaths.append(get_path_from_module(pkg.compiler.modules[1]))
-    return rpaths
+        rpaths.append(path_from_modules([pkg.compiler.modules[1]]))
+    return list(dedupe(filter_system_paths(rpaths)))
 
 
 def get_std_cmake_args(pkg):
@@ -671,8 +708,9 @@ def load_external_modules(pkg):
         pkg (PackageBase): package to load deps for
     """
     for dep in list(pkg.spec.traverse()):
-        if dep.external_module:
-            load_module(dep.external_module)
+        external_modules = dep.external_modules or []
+        for external_module in external_modules:
+            load_module(external_module)
 
 
 def setup_package(pkg, dirty):
@@ -716,10 +754,20 @@ def setup_package(pkg, dirty):
                 load_module("cce")
             load_module(mod)
 
+        # kludge to handle cray libsci being automatically loaded by PrgEnv
+        # modules on cray platform. Module unload does no damage when
+        # unnecessary
+        module('unload', 'cray-libsci')
+
         if pkg.architecture.target.module_name:
             load_module(pkg.architecture.target.module_name)
 
         load_external_modules(pkg)
+
+    implicit_rpaths = pkg.compiler.implicit_rpaths()
+    if implicit_rpaths:
+        build_env.set('SPACK_COMPILER_IMPLICIT_RPATHS',
+                      ':'.join(implicit_rpaths))
 
     # Make sure nothing's strange about the Spack environment.
     validate(build_env, tty.warn)
@@ -757,13 +805,72 @@ def modifications_from_dependencies(spec, context):
     return env
 
 
-def fork(pkg, function, dirty, fake):
-    """Fork a child process to do part of a spack build.
+def _setup_pkg_and_run(serialized_pkg, function, kwargs, child_pipe,
+                       input_multiprocess_fd):
+
+    try:
+        # We are in the child process. Python sets sys.stdin to
+        # open(os.devnull) to prevent our process and its parent from
+        # simultaneously reading from the original stdin. But, we assume
+        # that the parent process is not going to read from it till we
+        # are done with the child, so we undo Python's precaution.
+        if input_multiprocess_fd is not None:
+            sys.stdin = os.fdopen(input_multiprocess_fd.fd)
+
+        pkg = serialized_pkg.restore()
+
+        if not kwargs.get('fake', False):
+            kwargs['unmodified_env'] = os.environ.copy()
+            setup_package(pkg, dirty=kwargs.get('dirty', False))
+        return_value = function(pkg, kwargs)
+        child_pipe.send(return_value)
+
+    except StopPhase as e:
+        # Do not create a full ChildError from this, it's not an error
+        # it's a control statement.
+        child_pipe.send(e)
+    except BaseException:
+        # catch ANYTHING that goes wrong in the child process
+        exc_type, exc, tb = sys.exc_info()
+
+        # Need to unwind the traceback in the child because traceback
+        # objects can't be sent to the parent.
+        tb_string = traceback.format_exc()
+
+        # build up some context from the offending package so we can
+        # show that, too.
+        package_context = get_package_context(tb)
+
+        build_log = None
+        try:
+            if hasattr(pkg, 'log_path'):
+                build_log = pkg.log_path
+        except NameError:
+            # 'pkg' is not defined yet
+            pass
+
+        # make a pickleable exception to send to parent.
+        msg = "%s: %s" % (exc_type.__name__, str(exc))
+
+        ce = ChildError(msg,
+                        exc_type.__module__,
+                        exc_type.__name__,
+                        tb_string, build_log, package_context)
+        child_pipe.send(ce)
+
+    finally:
+        child_pipe.close()
+        if input_multiprocess_fd is not None:
+            input_multiprocess_fd.close()
+
+
+def start_build_process(pkg, function, kwargs):
+    """Create a child process to do part of a spack build.
 
     Args:
 
         pkg (PackageBase): package whose environment we should set up the
-            forked process for.
+            child process for.
         function (callable): argless function to run in the child
             process.
         dirty (bool): If True, do NOT clean the environment before
@@ -774,9 +881,9 @@ def fork(pkg, function, dirty, fake):
 
         def child_fun():
             # do stuff
-        build_env.fork(pkg, child_fun)
+        build_env.start_build_process(pkg, child_fun)
 
-    Forked processes are run with the build environment set up by
+    The child process is run with the build environment set up by
     spack.build_environment.  This allows package authors to have full
     control over the environment, etc. without affecting other builds
     that might be executed in the same spack call.
@@ -784,65 +891,36 @@ def fork(pkg, function, dirty, fake):
     If something goes wrong, the child process catches the error and
     passes it to the parent wrapped in a ChildError.  The parent is
     expected to handle (or re-raise) the ChildError.
+
+    This uses `multiprocessing.Process` to create the child process. The
+    mechanism used to create the process differs on different operating
+    systems and for different versions of Python. In some cases "fork"
+    is used (i.e. the "fork" system call) and some cases it starts an
+    entirely new Python interpreter process (in the docs this is referred
+    to as the "spawn" start method). Breaking it down by OS:
+
+    - Linux always uses fork.
+    - Mac OS uses fork before Python 3.8 and "spawn" for 3.8 and after.
+    - Windows always uses the "spawn" start method.
+
+    For more information on `multiprocessing` child process creation
+    mechanisms, see https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods
     """
-
-    def child_process(child_pipe, input_stream):
-        # We are in the child process. Python sets sys.stdin to
-        # open(os.devnull) to prevent our process and its parent from
-        # simultaneously reading from the original stdin. But, we assume
-        # that the parent process is not going to read from it till we
-        # are done with the child, so we undo Python's precaution.
-        if input_stream is not None:
-            sys.stdin = input_stream
-
-        try:
-            if not fake:
-                setup_package(pkg, dirty=dirty)
-            return_value = function()
-            child_pipe.send(return_value)
-        except StopIteration as e:
-            # StopIteration is used to stop installations
-            # before the final stage, mainly for debug purposes
-            tty.msg(e)
-            child_pipe.send(None)
-
-        except BaseException:
-            # catch ANYTHING that goes wrong in the child process
-            exc_type, exc, tb = sys.exc_info()
-
-            # Need to unwind the traceback in the child because traceback
-            # objects can't be sent to the parent.
-            tb_string = traceback.format_exc()
-
-            # build up some context from the offending package so we can
-            # show that, too.
-            package_context = get_package_context(tb)
-
-            build_log = None
-            if hasattr(pkg, 'log_path'):
-                build_log = pkg.log_path
-
-            # make a pickleable exception to send to parent.
-            msg = "%s: %s" % (exc_type.__name__, str(exc))
-
-            ce = ChildError(msg,
-                            exc_type.__module__,
-                            exc_type.__name__,
-                            tb_string, build_log, package_context)
-            child_pipe.send(ce)
-
-        finally:
-            child_pipe.close()
-
     parent_pipe, child_pipe = multiprocessing.Pipe()
-    input_stream = None
+    input_multiprocess_fd = None
+
+    serialized_pkg = spack.subprocess_context.PackageInstallContext(pkg)
+
     try:
         # Forward sys.stdin when appropriate, to allow toggling verbosity
         if sys.stdin.isatty() and hasattr(sys.stdin, 'fileno'):
-            input_stream = os.fdopen(os.dup(sys.stdin.fileno()))
+            input_fd = os.dup(sys.stdin.fileno())
+            input_multiprocess_fd = MultiProcessFd(input_fd)
 
         p = multiprocessing.Process(
-            target=child_process, args=(child_pipe, input_stream))
+            target=_setup_pkg_and_run,
+            args=(serialized_pkg, function, kwargs, child_pipe,
+                  input_multiprocess_fd))
         p.start()
 
     except InstallError as e:
@@ -851,21 +929,26 @@ def fork(pkg, function, dirty, fake):
 
     finally:
         # Close the input stream in the parent process
-        if input_stream is not None:
-            input_stream.close()
+        if input_multiprocess_fd is not None:
+            input_multiprocess_fd.close()
 
     child_result = parent_pipe.recv()
     p.join()
+
+    # If returns a StopPhase, raise it
+    if isinstance(child_result, StopPhase):
+        # do not print
+        raise child_result
 
     # let the caller know which package went wrong.
     if isinstance(child_result, InstallError):
         child_result.pkg = pkg
 
-    # If the child process raised an error, print its output here rather
-    # than waiting until the call to SpackError.die() in main(). This
-    # allows exception handling output to be logged from within Spack.
-    # see spack.main.SpackCommand.
     if isinstance(child_result, ChildError):
+        # If the child process raised an error, print its output here rather
+        # than waiting until the call to SpackError.die() in main(). This
+        # allows exception handling output to be logged from within Spack.
+        # see spack.main.SpackCommand.
         child_result.print_context()
         raise child_result
 
@@ -1054,3 +1137,13 @@ class ChildError(InstallError):
 def _make_child_error(msg, module, name, traceback, build_log, context):
     """Used by __reduce__ in ChildError to reconstruct pickled errors."""
     return ChildError(msg, module, name, traceback, build_log, context)
+
+
+class StopPhase(spack.error.SpackError):
+    """Pickle-able exception to control stopped builds."""
+    def __reduce__(self):
+        return _make_stop_phase, (self.message, self.long_message)
+
+
+def _make_stop_phase(msg, long_msg):
+    return StopPhase(msg, long_msg)

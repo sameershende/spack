@@ -213,34 +213,35 @@ def _hms(seconds):
     return ' '.join(parts)
 
 
-def _install_from_cache(pkg, cache_only, explicit, unsigned=False):
+def _install_from_cache(pkg, cache_only, explicit, unsigned=False,
+                        full_hash_match=False):
     """
-    Install the package from binary cache
+    Extract the package from binary cache
 
     Args:
         pkg (PackageBase): the package to install from the binary cache
-        cache_only (bool): only install from binary cache
+        cache_only (bool): only extract from binary cache
         explicit (bool): ``True`` if installing the package was explicitly
             requested by the user, otherwise, ``False``
         unsigned (bool): ``True`` if binary package signatures to be checked,
             otherwise, ``False``
 
     Return:
-        (bool) ``True`` if the package was installed from binary cache,
+        (bool) ``True`` if the package was extract from binary cache,
             ``False`` otherwise
     """
-    installed_from_cache = _try_install_from_binary_cache(pkg, explicit,
-                                                          unsigned)
+    installed_from_cache = _try_install_from_binary_cache(
+        pkg, explicit, unsigned=unsigned, full_hash_match=full_hash_match)
     pkg_id = package_id(pkg)
     if not installed_from_cache:
         pre = 'No binary for {0} found'.format(pkg_id)
         if cache_only:
             tty.die('{0} when cache-only specified'.format(pre))
 
-        tty.debug('{0}: installing from source'.format(pre))
+        tty.msg('{0}: installing from source'.format(pre))
         return False
 
-    tty.debug('Successfully installed {0} from binary cache'.format(pkg_id))
+    tty.debug('Successfully extracted {0} from binary cache'.format(pkg_id))
     _print_installed_pkg(pkg.spec.prefix)
     spack.hooks.post_install(pkg.spec)
     return True
@@ -272,20 +273,20 @@ def _process_external_package(pkg, explicit):
     pre = '{s.name}@{s.version} :'.format(s=pkg.spec)
     spec = pkg.spec
 
-    if spec.external_module:
+    if spec.external_modules:
         tty.msg('{0} has external module in {1}'
-                .format(pre, spec.external_module))
-        tty.msg('{0} is actually installed in {1}'
-                .format(pre, spec.external_path))
+                .format(pre, spec.external_modules))
+        tty.debug('{0} is actually installed in {1}'
+                  .format(pre, spec.external_path))
     else:
-        tty.msg("{0} externally installed in {1}"
+        tty.msg('{0} externally installed in {1}'
                 .format(pre, spec.external_path))
 
     try:
         # Check if the package was already registered in the DB.
         # If this is the case, then just exit.
         rec = spack.store.db.get_record(spec)
-        tty.msg('{0} already registered in DB'.format(pre))
+        tty.debug('{0} already registered in DB'.format(pre))
 
         # Update the value of rec.explicit if it is necessary
         _update_explicit_entry_in_db(pkg, rec, explicit)
@@ -294,15 +295,16 @@ def _process_external_package(pkg, explicit):
         # If not, register it and generate the module file.
         # For external packages we just need to run
         # post-install hooks to generate module files.
-        tty.msg('{0} generating module file'.format(pre))
+        tty.debug('{0} generating module file'.format(pre))
         spack.hooks.post_install(spec)
 
         # Add to the DB
-        tty.msg('{0} registering into DB'.format(pre))
+        tty.debug('{0} registering into DB'.format(pre))
         spack.store.db.add(spec, None, explicit=explicit)
 
 
-def _process_binary_cache_tarball(pkg, binary_spec, explicit, unsigned):
+def _process_binary_cache_tarball(pkg, binary_spec, explicit, unsigned,
+                                  preferred_mirrors=None):
     """
     Process the binary cache tarball.
 
@@ -312,12 +314,15 @@ def _process_binary_cache_tarball(pkg, binary_spec, explicit, unsigned):
         explicit (bool): the package was explicitly requested by the user
         unsigned (bool): ``True`` if binary package signatures to be checked,
             otherwise, ``False``
+        preferred_mirrors (list): Optional list of urls to prefer when
+            attempting to download the tarball
 
     Return:
-        (bool) ``True`` if the package was installed from binary cache,
+        (bool) ``True`` if the package was extracted from binary cache,
             else ``False``
     """
-    tarball = binary_distribution.download_tarball(binary_spec)
+    tarball = binary_distribution.download_tarball(
+        binary_spec, preferred_mirrors=preferred_mirrors)
     # see #10063 : install from source if tarball doesn't exist
     if tarball is None:
         tty.msg('{0} exists in binary cache but with different hash'
@@ -325,7 +330,7 @@ def _process_binary_cache_tarball(pkg, binary_spec, explicit, unsigned):
         return False
 
     pkg_id = package_id(pkg)
-    tty.msg('Installing {0} from binary cache'.format(pkg_id))
+    tty.msg('Extracting {0} from binary cache'.format(pkg_id))
     binary_distribution.extract_tarball(binary_spec, tarball, allow_root=False,
                                         unsigned=unsigned, force=False)
     pkg.installed_from_binary_cache = True
@@ -333,25 +338,31 @@ def _process_binary_cache_tarball(pkg, binary_spec, explicit, unsigned):
     return True
 
 
-def _try_install_from_binary_cache(pkg, explicit, unsigned=False):
+def _try_install_from_binary_cache(pkg, explicit, unsigned=False,
+                                   full_hash_match=False):
     """
-    Try to install the package from binary cache.
+    Try to extract the package from binary cache.
 
     Args:
-        pkg (PackageBase): the package to be installed from binary cache
+        pkg (PackageBase): the package to be extracted from binary cache
         explicit (bool): the package was explicitly requested by the user
         unsigned (bool): ``True`` if binary package signatures to be checked,
             otherwise, ``False``
     """
     pkg_id = package_id(pkg)
     tty.debug('Searching for binary cache of {0}'.format(pkg_id))
-    specs = binary_distribution.get_spec(pkg.spec, force=False)
-    binary_spec = spack.spec.Spec.from_dict(pkg.spec.to_dict())
-    binary_spec._mark_concrete()
-    if binary_spec not in specs:
+    matches = binary_distribution.get_mirrors_for_spec(
+        pkg.spec, force=False, full_hash_match=full_hash_match)
+
+    if not matches:
         return False
 
-    return _process_binary_cache_tarball(pkg, binary_spec, explicit, unsigned)
+    # In the absence of guidance from user or some other reason to prefer one
+    # mirror over another, any match will suffice, so just pick the first one.
+    preferred_mirrors = [match['mirror_url'] for match in matches]
+    binary_spec = matches[0]['spec']
+    return _process_binary_cache_tarball(pkg, binary_spec, explicit, unsigned,
+                                         preferred_mirrors=preferred_mirrors)
 
 
 def _update_explicit_entry_in_db(pkg, rec, explicit):
@@ -369,8 +380,15 @@ def _update_explicit_entry_in_db(pkg, rec, explicit):
         with spack.store.db.write_transaction():
             rec = spack.store.db.get_record(pkg.spec)
             message = '{s.name}@{s.version} : marking the package explicit'
-            tty.msg(message.format(s=pkg.spec))
+            tty.debug(message.format(s=pkg.spec))
             rec.explicit = True
+
+
+def clear_failures():
+    """
+    Remove all failure tracking markers for the Spack instance.
+    """
+    spack.store.db.clear_all_failures()
 
 
 def dump_packages(spec, path):
@@ -398,9 +416,14 @@ def dump_packages(spec, path):
             source = spack.store.layout.build_packages_path(node)
             source_repo_root = os.path.join(source, node.namespace)
 
-            # There's no provenance installed for the source package.  Skip it.
-            # User can always get something current from the builtin repo.
-            if not os.path.isdir(source_repo_root):
+            # If there's no provenance installed for the package, skip it.
+            # If it's external, skip it because it either:
+            # 1) it wasn't built with Spack, so it has no Spack metadata
+            # 2) it was built by another Spack instance, and we do not
+            # (currently) use Spack metadata to associate repos with externals
+            # built by other Spack instances.
+            # Spack can always get something current from the builtin repo.
+            if node.external or not os.path.isdir(source_repo_root):
                 continue
 
             # Create a source repo and get the pkg directory out of it.
@@ -440,7 +463,8 @@ def install_msg(name, pid):
     Return:
         (str) Colorized installing message
     """
-    return '{0}: '.format(pid) + colorize('@*{Installing} @*g{%s}' % name)
+    pre = '{0}: '.format(pid) if tty.show_pid() else ''
+    return pre + colorize('@*{Installing} @*g{%s}' % name)
 
 
 def log(pkg):
@@ -453,7 +477,6 @@ def log(pkg):
     packages_dir = spack.store.layout.build_packages_path(pkg.spec)
 
     # Remove first if we're overwriting another build
-    # (can happen with spack setup)
     try:
         # log and env install paths are inside this
         shutil.rmtree(packages_dir)
@@ -549,8 +572,10 @@ install_args_docstring = """
             dirty (bool): Don't clean the build environment before installing.
             explicit (bool): True if package was explicitly installed, False
                 if package was implicitly installed (as a dependency).
+            fail_fast (bool): Fail if any dependency fails to install;
+                otherwise, the default is to install as many dependencies as
+                possible (i.e., best effort installation).
             fake (bool): Don't really build; install fake stub files instead.
-            force (bool): Install again, even if already installed.
             install_deps (bool): Install dependencies before installing this
                 package
             install_source (bool): By default, source is not installed, but
@@ -560,8 +585,12 @@ install_args_docstring = """
             keep_stage (bool): By default, stage is destroyed only if there
                 are no exceptions during build. Set to True to keep the stage
                 even with exceptions.
+            overwrite (list): list of hashes for packages to do overwrite
+                installs. Default empty list.
             restage (bool): Force spack to restage the package source.
             skip_patch (bool): Skip patch stage of build if True.
+            stop_before (InstallPhase): stop execution before this
+                installation phase (or None)
             stop_at (InstallPhase): last installation phase to be executed
                 (or None)
             tests (bool or list or set): False to run no tests, True to test
@@ -620,6 +649,10 @@ class PackageInstaller(object):
 
         # Cache of installed packages' unique ids
         self.installed = set()
+
+        # Cache of overwrite information
+        self.overwrite = set()
+        self.overwrite_time = time.time()
 
         # Data store layout
         self.layout = spack.store.layout
@@ -710,7 +743,9 @@ class PackageInstaller(object):
             # Check the database to see if the dependency has been installed
             # and flag as such if appropriate
             rec, installed_in_db = self._check_db(dep)
-            if installed_in_db:
+            if installed_in_db and (
+                    dep.dag_hash() not in self.overwrite or
+                    rec.installation_time > self.overwrite_time):
                 tty.debug('Flagging {0} as installed per the database'
                           .format(dep_id))
                 self.installed.add(dep_id)
@@ -761,7 +796,10 @@ class PackageInstaller(object):
         if restage and task.pkg.stage.managed_by_spack:
             task.pkg.stage.destroy()
 
-        if not partial and self.layout.check_installed(task.pkg.spec):
+        if not partial and self.layout.check_installed(task.pkg.spec) and (
+                rec.spec.dag_hash() not in self.overwrite or
+                rec.installation_time > self.overwrite_time
+        ):
             self._update_installed(task)
 
             # Only update the explicit entry once for the explicit package
@@ -779,17 +817,32 @@ class PackageInstaller(object):
         Ensures the package being installed has a valid last phase before
         proceeding with the installation.
 
-        The ``stop_at`` argument is removed from the installation arguments.
+        The ``stop_before`` or ``stop_at`` arguments are removed from the
+        installation arguments.
+
+        The last phase is also set to None if it is the last phase of the
+        package already
 
         Args:
             kwargs:
+              ``stop_before``': stop before execution of this phase (or None)
               ``stop_at``': last installation phase to be executed (or None)
         """
+        self.pkg.stop_before_phase = kwargs.pop('stop_before', None)
+        if self.pkg.stop_before_phase is not None and \
+           self.pkg.stop_before_phase not in self.pkg.phases:
+            tty.die('\'{0}\' is not an allowed phase for package {1}'
+                    .format(self.pkg.stop_before_phase, self.pkg.name))
+
         self.pkg.last_phase = kwargs.pop('stop_at', None)
         if self.pkg.last_phase is not None and \
                 self.pkg.last_phase not in self.pkg.phases:
             tty.die('\'{0}\' is not an allowed phase for package {1}'
                     .format(self.pkg.last_phase, self.pkg.name))
+        # If we got a last_phase, make sure it's not already last
+        if self.pkg.last_phase and \
+                self.pkg.last_phase == self.pkg.phases[-1]:
+            self.pkg.last_phase = None
 
     def _cleanup_all_tasks(self):
         """Cleanup all build tasks to include releasing their locks."""
@@ -815,7 +868,7 @@ class PackageInstaller(object):
         """
         lock = self.failed.get(pkg_id, None)
         if lock is not None:
-            err = "{0} exception when removing failure mark for {1}: {2}"
+            err = "{0} exception when removing failure tracking for {1}: {2}"
             msg = 'Removing failure mark on {0}'
             try:
                 tty.verbose(msg.format(pkg_id))
@@ -1003,15 +1056,10 @@ class PackageInstaller(object):
             task (BuildTask): the installation build task for a package"""
 
         cache_only = kwargs.get('cache_only', False)
-        dirty = kwargs.get('dirty', False)
-        fake = kwargs.get('fake', False)
-        install_source = kwargs.get('install_source', False)
-        keep_stage = kwargs.get('keep_stage', False)
-        skip_patch = kwargs.get('skip_patch', False)
         tests = kwargs.get('tests', False)
         unsigned = kwargs.get('unsigned', False)
         use_cache = kwargs.get('use_cache', True)
-        verbose = kwargs.get('verbose', False)
+        full_hash_match = kwargs.get('full_hash_match', False)
 
         pkg = task.pkg
         pkg_id = package_id(pkg)
@@ -1023,114 +1071,15 @@ class PackageInstaller(object):
 
         # Use the binary cache if requested
         if use_cache and \
-                _install_from_cache(pkg, cache_only, explicit, unsigned):
+                _install_from_cache(pkg, cache_only, explicit, unsigned,
+                                    full_hash_match):
             self._update_installed(task)
+            if task.compiler:
+                spack.compilers.add_compilers_to_config(
+                    spack.compilers.find_compilers([pkg.spec.prefix]))
             return
 
         pkg.run_tests = (tests is True or tests and pkg.name in tests)
-
-        pre = '{0}: {1}:'.format(self.pid, pkg.name)
-
-        def build_process():
-            """
-            This function implements the process forked for each build.
-
-            It has its own process and python module space set up by
-            build_environment.fork().
-
-            This function's return value is returned to the parent process.
-            """
-            start_time = time.time()
-            if not fake:
-                if not skip_patch:
-                    pkg.do_patch()
-                else:
-                    pkg.do_stage()
-
-            pkg_id = package_id(pkg)
-            tty.msg('{0} Building {1} [{2}]'
-                    .format(pre, pkg_id, pkg.build_system_class))
-
-            # get verbosity from do_install() parameter or saved value
-            echo = verbose
-            if spack.package.PackageBase._verbose is not None:
-                echo = spack.package.PackageBase._verbose
-
-            pkg.stage.keep = keep_stage
-
-            # parent process already has a prefix write lock
-            with pkg.stage:
-                # Run the pre-install hook in the child process after
-                # the directory is created.
-                spack.hooks.pre_install(pkg.spec)
-                if fake:
-                    _do_fake_install(pkg)
-                else:
-                    source_path = pkg.stage.source_path
-                    if install_source and os.path.isdir(source_path):
-                        src_target = os.path.join(pkg.spec.prefix, 'share',
-                                                  pkg.name, 'src')
-                        tty.msg('{0} Copying source to {1}'
-                                .format(pre, src_target))
-                        fs.install_tree(pkg.stage.source_path, src_target)
-
-                    # Do the real install in the source directory.
-                    with fs.working_dir(pkg.stage.source_path):
-                        # Save the build environment in a file before building.
-                        dump_environment(pkg.env_path)
-
-                        for attr in ('configure_args', 'cmake_args'):
-                            try:
-                                configure_args = getattr(pkg, attr)()
-                                configure_args = ' '.join(configure_args)
-
-                                with open(pkg.configure_args_path, 'w') as \
-                                        args_file:
-                                    args_file.write(configure_args)
-
-                                break
-                            except Exception:
-                                pass
-
-                        # cache debug settings
-                        debug_enabled = tty.is_debug()
-
-                        # Spawn a daemon that reads from a pipe and redirects
-                        # everything to log_path
-                        with log_output(pkg.log_path, echo, True) as logger:
-                            for phase_name, phase_attr in zip(
-                                    pkg.phases, pkg._InstallPhase_phases):
-
-                                with logger.force_echo():
-                                    inner_debug = tty.is_debug()
-                                    tty.set_debug(debug_enabled)
-                                    tty.msg("{0} Executing phase: '{1}'"
-                                            .format(pre, phase_name))
-                                    tty.set_debug(inner_debug)
-
-                                # Redirect stdout and stderr to daemon pipe
-                                phase = getattr(pkg, phase_attr)
-                                phase(pkg.spec, pkg.prefix)
-
-                    echo = logger.echo
-                    log(pkg)
-
-                # Run post install hooks before build stage is removed.
-                spack.hooks.post_install(pkg.spec)
-
-            # Stop the timer
-            pkg._total_time = time.time() - start_time
-            build_time = pkg._total_time - pkg._fetch_time
-
-            tty.msg('{0} Successfully installed {1}'
-                    .format(pre, pkg_id),
-                    'Fetch: {0}.  Build: {1}.  Total: {2}.'
-                    .format(_hms(pkg._fetch_time), _hms(build_time),
-                            _hms(pkg._total_time)))
-            _print_installed_pkg(pkg.prefix)
-
-            # preserve verbosity across runs
-            return echo
 
         # hook that allows tests to inspect the Package before installation
         # see unit_test_check() docs.
@@ -1140,10 +1089,12 @@ class PackageInstaller(object):
         try:
             self._setup_install_dir(pkg)
 
-            # Fork a child to do the actual installation.
+            # Create a child process to do the actual installation.
             # Preserve verbosity settings across installs.
-            spack.package.PackageBase._verbose = spack.build_environment.fork(
-                pkg, build_process, dirty=dirty, fake=fake)
+            spack.package.PackageBase._verbose = (
+                spack.build_environment.start_build_process(
+                    pkg, build_process, kwargs)
+            )
 
             # Note: PARENT of the build process adds the new package to
             # the database, so that we don't need to re-read from file.
@@ -1154,13 +1105,13 @@ class PackageInstaller(object):
             if task.compiler:
                 spack.compilers.add_compilers_to_config(
                     spack.compilers.find_compilers([pkg.spec.prefix]))
-
-        except StopIteration as e:
-            # A StopIteration exception means that do_install was asked to
-            # stop early from clients.
-            tty.msg('{0} {1}'.format(self.pid, str(e)))
-            tty.msg('Package stage directory : {0}'
-                    .format(pkg.stage.source_path))
+        except spack.build_environment.StopPhase as e:
+            # A StopPhase exception means that do_install was asked to
+            # stop early from clients, and is not an error at this point
+            pid = '{0}: '.format(pkg.pid) if tty.show_pid() else ''
+            tty.debug('{0}{1}'.format(pid, str(e)))
+            tty.debug('Package stage directory: {0}'
+                      .format(pkg.stage.source_path))
 
     _install_task.__doc__ += install_args_docstring
 
@@ -1369,14 +1320,23 @@ class PackageInstaller(object):
 
         Args:"""
 
+        fail_fast = kwargs.get('fail_fast', False)
         install_deps = kwargs.get('install_deps', True)
         keep_prefix = kwargs.get('keep_prefix', False)
         keep_stage = kwargs.get('keep_stage', False)
         restage = kwargs.get('restage', False)
 
+        fail_fast_err = 'Terminating after first install failure'
+
         # install_package defaults True and is popped so that dependencies are
         # always installed regardless of whether the root was installed
         install_package = kwargs.pop('install_package', True)
+
+        # take a timestamp with the overwrite argument to check whether another
+        # process has already overridden the package.
+        self.overwrite = set(kwargs.get('overwrite', []))
+        if self.overwrite:
+            self.overwrite_time = time.time()
 
         # Ensure not attempting to perform an installation when user didn't
         # want to go that far.
@@ -1433,6 +1393,10 @@ class PackageInstaller(object):
             if pkg_id in self.failed or spack.store.db.prefix_failed(spec):
                 tty.warn('{0} failed to install'.format(pkg_id))
                 self._update_failed(task)
+
+                if fail_fast:
+                    raise InstallError(fail_fast_err)
+
                 continue
 
             # Attempt to get a write lock.  If we can't get the lock then
@@ -1466,6 +1430,12 @@ class PackageInstaller(object):
                 if lock is not None:
                     self._update_installed(task)
                     _print_installed_pkg(pkg.prefix)
+
+                    # It's an already installed compiler, add it to the config
+                    if task.compiler:
+                        spack.compilers.add_compilers_to_config(
+                            spack.compilers.find_compilers([pkg.spec.prefix]))
+
                 else:
                     # At this point we've failed to get a write or a read
                     # lock, which means another process has taken a write
@@ -1494,25 +1464,62 @@ class PackageInstaller(object):
             # Proceed with the installation since we have an exclusive write
             # lock on the package.
             try:
-                self._install_task(task, **kwargs)
+                if pkg.spec.dag_hash() in self.overwrite:
+                    rec, _ = self._check_db(pkg.spec)
+                    if rec and rec.installed:
+                        if rec.installation_time < self.overwrite_time:
+                            # If it's actually overwriting, do a fs transaction
+                            if os.path.exists(rec.path):
+                                with fs.replace_directory_transaction(
+                                        rec.path):
+                                    self._install_task(task, **kwargs)
+                            else:
+                                tty.debug("Missing installation to overwrite")
+                                self._install_task(task, **kwargs)
+                    else:
+                        # overwriting nothing
+                        self._install_task(task, **kwargs)
+                else:
+                    self._install_task(task, **kwargs)
                 self._update_installed(task)
 
                 # If we installed then we should keep the prefix
+                stop_before_phase = getattr(pkg, 'stop_before_phase', None)
                 last_phase = getattr(pkg, 'last_phase', None)
-                keep_prefix = last_phase is None or keep_prefix
+                keep_prefix = keep_prefix or \
+                    (stop_before_phase is None and last_phase is None)
 
             except spack.directory_layout.InstallDirectoryAlreadyExistsError:
                 tty.debug("Keeping existing install prefix in place.")
                 self._update_installed(task)
                 raise
 
-            except (Exception, KeyboardInterrupt, SystemExit) as exc:
-                # Assuming best effort installs so suppress the exception and
-                # mark as a failure UNLESS this is the explicit package.
+            except KeyboardInterrupt as exc:
+                # The build has been terminated with a Ctrl-C so terminate.
                 err = 'Failed to install {0} due to {1}: {2}'
                 tty.error(err.format(pkg.name, exc.__class__.__name__,
                           str(exc)))
+                raise
+
+            except (Exception, SystemExit) as exc:
+                # Best effort installs suppress the exception and mark the
+                # package as a failure UNLESS this is the explicit package.
+                if (not isinstance(exc, spack.error.SpackError) or
+                    not exc.printed):
+                    # SpackErrors can be printed by the build process or at
+                    # lower levels -- skip printing if already printed.
+                    # TODO: sort out this and SpackEror.print_context()
+                    err = 'Failed to install {0} due to {1}: {2}'
+                    tty.error(
+                        err.format(pkg.name, exc.__class__.__name__, str(exc)))
+
                 self._update_failed(task, True, exc)
+
+                if fail_fast:
+                    # The user requested the installation to terminate on
+                    # failure.
+                    raise InstallError('{0}: {1}'
+                                       .format(fail_fast_err, str(exc)))
 
                 if pkg_id == self.pkg_id:
                     raise
@@ -1549,6 +1556,117 @@ class PackageInstaller(object):
     def spec(self):
         """The specification associated with the package."""
         return self.pkg.spec
+
+
+def build_process(pkg, kwargs):
+    """Perform the installation/build of the package.
+
+    This runs in a separate child process, and has its own process and
+    python module space set up by build_environment.start_build_process().
+
+    This function's return value is returned to the parent process.
+    """
+    keep_stage = kwargs.get('keep_stage', False)
+    install_source = kwargs.get('install_source', False)
+    skip_patch = kwargs.get('skip_patch', False)
+    verbose = kwargs.get('verbose', False)
+    fake = kwargs.get('fake', False)
+    unmodified_env = kwargs.get('unmodified_env', {})
+
+    start_time = time.time()
+    if not fake:
+        if not skip_patch:
+            pkg.do_patch()
+        else:
+            pkg.do_stage()
+
+    pid = '{0}: '.format(pkg.pid) if tty.show_pid() else ''
+    pre = '{0}{1}:'.format(pid, pkg.name)
+    pkg_id = package_id(pkg)
+
+    tty.debug('{0} Building {1} [{2}]'
+              .format(pre, pkg_id, pkg.build_system_class))
+
+    # get verbosity from do_install() parameter or saved value
+    echo = verbose
+    if spack.package.PackageBase._verbose is not None:
+        echo = spack.package.PackageBase._verbose
+
+    pkg.stage.keep = keep_stage
+    with pkg.stage:
+        # Run the pre-install hook in the child process after
+        # the directory is created.
+        spack.hooks.pre_install(pkg.spec)
+        if fake:
+            _do_fake_install(pkg)
+        else:
+            source_path = pkg.stage.source_path
+            if install_source and os.path.isdir(source_path):
+                src_target = os.path.join(pkg.spec.prefix, 'share',
+                                          pkg.name, 'src')
+                tty.debug('{0} Copying source to {1}'
+                          .format(pre, src_target))
+                fs.install_tree(pkg.stage.source_path, src_target)
+
+            # Do the real install in the source directory.
+            with fs.working_dir(pkg.stage.source_path):
+                # Save the build environment in a file before building.
+                dump_environment(pkg.env_path)
+
+                for attr in ('configure_args', 'cmake_args'):
+                    try:
+                        configure_args = getattr(pkg, attr)()
+                        configure_args = ' '.join(configure_args)
+
+                        with open(pkg.configure_args_path, 'w') as \
+                                args_file:
+                            args_file.write(configure_args)
+
+                        break
+                    except Exception:
+                        pass
+
+                # cache debug settings
+                debug_level = tty.debug_level()
+
+                # Spawn a daemon that reads from a pipe and redirects
+                # everything to log_path
+                with log_output(pkg.log_path, echo, True,
+                                env=unmodified_env) as logger:
+
+                    for phase_name, phase_attr in zip(
+                            pkg.phases, pkg._InstallPhase_phases):
+
+                        with logger.force_echo():
+                            inner_debug_level = tty.debug_level()
+                            tty.set_debug(debug_level)
+                            tty.msg("{0} Executing phase: '{1}'"
+                                    .format(pre, phase_name))
+                            tty.set_debug(inner_debug_level)
+
+                        # Redirect stdout and stderr to daemon pipe
+                        phase = getattr(pkg, phase_attr)
+                        phase(pkg.spec, pkg.prefix)
+
+            echo = logger.echo
+            log(pkg)
+
+        # Run post install hooks before build stage is removed.
+        spack.hooks.post_install(pkg.spec)
+
+    # Stop the timer
+    pkg._total_time = time.time() - start_time
+    build_time = pkg._total_time - pkg._fetch_time
+
+    tty.debug('{0} Successfully installed {1}'
+              .format(pre, pkg_id),
+              'Fetch: {0}.  Build: {1}.  Total: {2}.'
+              .format(_hms(pkg._fetch_time), _hms(build_time),
+                      _hms(pkg._total_time)))
+    _print_installed_pkg(pkg.prefix)
+
+    # preserve verbosity across runs
+    return echo
 
 
 class BuildTask(object):
